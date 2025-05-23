@@ -146,31 +146,122 @@ class InventoryPacketAnalyzer:
             return any(pattern in payload for pattern in common_patterns)
         return False
     
-    def start_inventory_capture(self, duration=300):
+    def identify_albion_traffic(self):
+        """First identify Albion Online's network traffic patterns"""
+        print("=== Albion Online Traffic Identification ===")
+        print("Please start Albion Online now if not already running...")
+        input("Press Enter when the game is running and you're logged in...")
+        
+        print("\nPhase 1: Identifying Albion traffic patterns...")
+        print("Capturing network activity for 30 seconds...")
+        print("Please perform some basic actions in game (move around, open inventory, etc.)")
+        
+        temp_packets = []
+        
+        def temp_handler(pkt):
+            if pkt.haslayer(IP) and (pkt.haslayer(TCP) or pkt.haslayer(UDP)):
+                temp_packets.append(pkt)
+        
+        sniff(timeout=30, prn=temp_handler)
+        
+        # Analyze captured traffic to identify game servers
+        print(f"\nAnalyzing {len(temp_packets)} packets...")
+        
+        # Count packets by destination and port
+        traffic_analysis = collections.defaultdict(lambda: {'tcp_ports': set(), 'udp_ports': set(), 'count': 0})
+        
+        for pkt in temp_packets:
+            dst_ip = pkt[IP].dst
+            traffic_analysis[dst_ip]['count'] += 1
+            
+            if pkt.haslayer(TCP):
+                traffic_analysis[dst_ip]['tcp_ports'].add(pkt[TCP].dport)
+            elif pkt.haslayer(UDP):
+                traffic_analysis[dst_ip]['udp_ports'].add(pkt[UDP].dport)
+        
+        # Find most active destinations (likely game servers)
+        top_destinations = sorted(traffic_analysis.items(), key=lambda x: x[1]['count'], reverse=True)
+        
+        print("\nTop network destinations (potential game servers):")
+        albion_servers = []
+        
+        for i, (ip, data) in enumerate(top_destinations[:10]):
+            tcp_ports = list(data['tcp_ports'])[:5]  # Show first 5 ports
+            udp_ports = list(data['udp_ports'])[:5]
+            
+            print(f"{i+1}. {ip} - {data['count']} packets")
+            if tcp_ports:
+                print(f"   TCP ports: {tcp_ports}")
+            if udp_ports:
+                print(f"   UDP ports: {udp_ports}")
+            
+            # Heuristic: Game servers usually have consistent traffic and specific port patterns
+            if data['count'] > 10:  # Reasonable amount of traffic
+                albion_servers.append({
+                    'ip': ip,
+                    'tcp_ports': tcp_ports,
+                    'udp_ports': udp_ports,
+                    'packet_count': data['count']
+                })
+        
+        return albion_servers
+    
+    def start_inventory_capture(self, duration=300, albion_servers=None):
         """Start capturing packets specifically looking for inventory data"""
-        print(f"=== Inventory Packet Analyzer ===")
-        print(f"Starting capture for {duration} seconds...")
+        print(f"\n=== Inventory Packet Analyzer ===")
+        
+        if not albion_servers:
+            albion_servers = self.identify_albion_traffic()
+        
+        if not albion_servers:
+            print("No Albion servers identified. Proceeding with general capture...")
+            sniff(timeout=duration, prn=self.analyze_packet)
+            self.generate_inventory_report()
+            return
+        
+        # Build filter for Albion traffic
+        filters = []
+        print(f"\nTargeting {len(albion_servers)} potential Albion servers:")
+        
+        for server in albion_servers[:3]:  # Focus on top 3 servers
+            ip = server['ip']
+            print(f"  {ip} ({server['packet_count']} packets)")
+            
+            # Create filters for this server's ports
+            server_filters = [f"host {ip}"]
+            
+            # Add specific port filters if we identified common ports
+            if server['tcp_ports']:
+                common_tcp = server['tcp_ports'][:3]  # Use top 3 TCP ports
+                for port in common_tcp:
+                    server_filters.append(f"(host {ip} and tcp port {port})")
+            
+            if server['udp_ports']:
+                common_udp = server['udp_ports'][:3]  # Use top 3 UDP ports
+                for port in common_udp:
+                    server_filters.append(f"(host {ip} and udp port {port})")
+            
+            filters.extend(server_filters)
+        
+        # Combine all filters
+        combined_filter = " or ".join(filters[:10])  # Limit to avoid overly complex filter
+        print(f"\nUsing filter: {combined_filter[:100]}...")
+        
+        print(f"\nStarting focused capture for {duration} seconds...")
         print("Recommended test sequence:")
         print("1. Open your inventory/chests")
         print("2. Move some items around")
         print("3. Check item quantities")
         print("4. Open/close storage containers")
         print("5. Perform trades or market operations")
-        print("\nStarting capture now...\n")
+        print("\nCapturing now...\n")
         
-        # First, do a quick capture to identify game servers
-        print("Phase 1: Identifying game servers...")
-        sniff(timeout=10, prn=self.analyze_packet)
-        
-        if self.game_servers:
-            print(f"Found potential game servers: {list(self.game_servers)}")
-            # Filter for game server traffic
-            server_filter = " or ".join([f"host {ip}" for ip in list(self.game_servers)[:3]])
-            print(f"Phase 2: Focused capture on game servers...")
-            sniff(filter=server_filter, timeout=duration-10, prn=self.analyze_packet)
-        else:
-            print("No game servers identified, continuing with all traffic...")
-            sniff(timeout=duration-10, prn=self.analyze_packet)
+        try:
+            sniff(filter=combined_filter, timeout=duration, prn=self.analyze_packet)
+        except Exception as e:
+            print(f"Filter error: {e}")
+            print("Falling back to unfiltered capture...")
+            sniff(timeout=duration, prn=self.analyze_packet)
         
         self.generate_inventory_report()
     
@@ -245,13 +336,46 @@ class InventoryPacketAnalyzer:
         except Exception as e:
             print(f"Error saving data: {e}")
 
+# Quick Albion port discovery script
+def quick_albion_port_discovery():
+    """Quick script to find Albion's commonly used ports"""
+    print("=== Quick Albion Port Discovery ===")
+    print("This will help identify common ports used by Albion Online")
+    print("Make sure Albion is running and you're logged in!")
+    input("Press Enter to start 15-second capture...")
+    
+    port_usage = collections.defaultdict(int)
+    
+    def port_analyzer(pkt):
+        if pkt.haslayer(TCP):
+            port_usage[f"TCP-{pkt[TCP].dport}"] += 1
+        elif pkt.haslayer(UDP):
+            port_usage[f"UDP-{pkt[UDP].dport}"] += 1
+    
+    sniff(timeout=15, prn=port_analyzer)
+    
+    print("\nMost used ports (likely Albion traffic):")
+    for port, count in sorted(port_usage.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(f"  {port}: {count} packets")
+    
+    return port_usage
+
 # Usage example
 if __name__ == "__main__":
-    analyzer = InventoryPacketAnalyzer()
-    
-    print("Inventory Packet Analyzer for Storage Management")
-    print("This tool will help identify packets containing inventory/chest data")
+    print("Albion Online Network Analysis Tool")
     print("Make sure to run as Administrator on Windows!\n")
     
-    # You can adjust the capture duration
-    analyzer.start_inventory_capture(duration=120)  # 2 minutes of capture
+    print("Choose analysis mode:")
+    print("1. Quick port discovery")
+    print("2. Full inventory packet analysis")
+    choice = input("Enter choice (1 or 2): ").strip()
+    
+    if choice == "1":
+        quick_albion_port_discovery()
+    else:
+        analyzer = InventoryPacketAnalyzer()
+        print("\nInventory Packet Analyzer for Storage Management")
+        print("This tool will help identify packets containing inventory/chest data\n")
+        
+        # You can adjust the capture duration
+        analyzer.start_inventory_capture(duration=120)  # 2 minutes of capture
