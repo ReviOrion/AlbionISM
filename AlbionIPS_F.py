@@ -1,401 +1,432 @@
-import socket
-import json
 import threading
-import platform
 import time
-import struct
+import json
+import os
 from datetime import datetime
-from collections import defaultdict, Counter
+import csv
+import sys
 
-def local_ip():
-    """Get local IP address"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))
-    ip = s.getsockname()[0]
-    s.close()
-    return ip
+try:
+    from scapy.all import *
+    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.layers.l2 import Ether
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    print("Scapy not found! Please install it with: pip install scapy")
 
-class InventoryItem:
-    """Represents an item found in inventory/storage data"""
-    
-    def __init__(self, data_dict):
-        self.raw_data = data_dict
-        # Extract common inventory fields if they exist
-        self.item_id = data_dict.get('ItemTypeId', data_dict.get('ItemId', 'Unknown'))
-        self.quantity = data_dict.get('Amount', data_dict.get('Count', 1))
-        self.quality = data_dict.get('QualityLevel', data_dict.get('Quality', 0))
-        self.enchantment = data_dict.get('EnchantmentLevel', data_dict.get('Enchant', 0))
-        self.tier = data_dict.get('Tier', 0)
+class AlbionPacketSniffer:
+    def __init__(self, save_format='json', save_directory='captured_packets', interface=None):
+        if not SCAPY_AVAILABLE:
+            raise ImportError("Scapy is required but not installed. Run: pip install scapy")
+            
+        self.running = False
+        self.save_format = save_format.lower()
+        self.save_directory = save_directory
+        self.packets_captured = []
+        self.session_start = None
+        self.interface = interface
         
-    def __str__(self):
-        return f"Item(ID:{self.item_id}, Qty:{self.quantity}, T{self.tier}.{self.enchantment}@{self.quality})"
-
-class InventoryData:
-    """Container for organized inventory/storage data"""
+        # Create save directory if it doesn't exist
+        if not os.path.exists(self.save_directory):
+            os.makedirs(self.save_directory)
+        
+        # Albion Online related ports and information
+        self.albion_ports = [5056, 5055, 5054, 5053, 5052]  # Common Albion ports
+        self.albion_port_range = range(5050, 5065)  # Extended range
+        self.packet_count = 0
+        
+        # Known Albion server IPs (you can extend this list)
+        self.albion_server_patterns = [
+            '5.45.187.',    # Some known Albion server ranges
+            '5.45.186.',
+            '5.45.185.',
+            # Add more as you discover them
+        ]
     
-    def __init__(self, logs, parsed_items, malformed, container_info=None):
-        self.logs = logs[:]
-        self.parsed_items = parsed_items[:]
-        self.malformed = malformed[:]
-        self.container_info = container_info or {}
-        self.timestamp = datetime.now()
+    def get_available_interfaces(self):
+        """Get list of available network interfaces"""
+        try:
+            interfaces = get_if_list()
+            print("Available network interfaces:")
+            for i, iface in enumerate(interfaces):
+                try:
+                    ip = get_if_addr(iface)
+                    print(f"{i+1}. {iface} ({ip})")
+                except:
+                    print(f"{i+1}. {iface} (no IP)")
+            return interfaces
+        except Exception as e:
+            print(f"Error getting interfaces: {e}")
+            return []
     
-    def __len__(self):
-        return len(self.parsed_items)
+    def select_interface(self):
+        """Let user select network interface"""
+        interfaces = self.get_available_interfaces()
+        if not interfaces:
+            print("No interfaces found, using default")
+            return None
+            
+        while True:
+            try:
+                choice = input(f"\nSelect interface (1-{len(interfaces)}) or press Enter for auto: ").strip()
+                if not choice:
+                    return None  # Auto-select
+                
+                choice = int(choice)
+                if 1 <= choice <= len(interfaces):
+                    selected = interfaces[choice - 1]
+                    print(f"Selected interface: {selected}")
+                    return selected
+                else:
+                    print("Invalid choice!")
+            except ValueError:
+                print("Please enter a number!")
     
-    def get_summary(self):
-        """Get summary of inventory contents"""
-        summary = {
-            'total_items': len(self.parsed_items),
-            'unique_items': len(set(item.item_id for item in self.parsed_items)),
-            'total_quantity': sum(item.quantity for item in self.parsed_items),
-            'malformed_packets': len(self.malformed),
-            'timestamp': self.timestamp.isoformat()
+    def is_albion_packet(self, packet):
+        """Enhanced Albion packet detection"""
+        try:
+            if not packet.haslayer(IP):
+                return False
+            
+            ip_layer = packet[IP]
+            src_ip = ip_layer.src
+            dst_ip = ip_layer.dst
+            
+            # Check for TCP or UDP layers
+            src_port = dst_port = None
+            protocol = "Unknown"
+            
+            if packet.haslayer(TCP):
+                tcp_layer = packet[TCP]
+                src_port = tcp_layer.sport
+                dst_port = tcp_layer.dport
+                protocol = "TCP"
+            elif packet.haslayer(UDP):
+                udp_layer = packet[UDP]
+                src_port = udp_layer.sport
+                dst_port = udp_layer.dport
+                protocol = "UDP"
+            else:
+                return False
+            
+            # Check if packet matches Albion criteria
+            port_match = (src_port in self.albion_ports or 
+                         dst_port in self.albion_ports or
+                         src_port in self.albion_port_range or
+                         dst_port in self.albion_port_range)
+            
+            # Check if IP matches known Albion server patterns
+            ip_match = any(pattern in src_ip or pattern in dst_ip 
+                          for pattern in self.albion_server_patterns)
+            
+            return port_match or ip_match
+            
+        except Exception as e:
+            return False
+    
+    def extract_packet_info(self, packet):
+        """Extract detailed information from packet"""
+        try:
+            packet_info = {
+                'timestamp': datetime.now().isoformat(),
+                'packet_size': len(packet)
+            }
+            
+            # Extract IP information
+            if packet.haslayer(IP):
+                ip_layer = packet[IP]
+                packet_info.update({
+                    'src_ip': ip_layer.src,
+                    'dest_ip': ip_layer.dst,
+                    'ip_version': ip_layer.version,
+                    'ttl': ip_layer.ttl,
+                    'ip_flags': ip_layer.flags
+                })
+            
+            # Extract TCP information
+            if packet.haslayer(TCP):
+                tcp_layer = packet[TCP]
+                packet_info.update({
+                    'protocol': 'TCP',
+                    'src_port': tcp_layer.sport,
+                    'dest_port': tcp_layer.dport,
+                    'sequence': tcp_layer.seq,
+                    'acknowledgment': tcp_layer.ack,
+                    'tcp_flags': str(tcp_layer.flags),
+                    'window_size': tcp_layer.window
+                })
+                
+                # Extract payload
+                if tcp_layer.payload:
+                    payload_bytes = bytes(tcp_layer.payload)
+                    packet_info.update({
+                        'payload_size': len(payload_bytes),
+                        'payload_hex': payload_bytes.hex(),
+                        'payload_raw': payload_bytes[:100].hex() if len(payload_bytes) > 100 else payload_bytes.hex()  # First 100 bytes
+                    })
+                else:
+                    packet_info.update({
+                        'payload_size': 0,
+                        'payload_hex': '',
+                        'payload_raw': ''
+                    })
+            
+            # Extract UDP information
+            elif packet.haslayer(UDP):
+                udp_layer = packet[UDP]
+                packet_info.update({
+                    'protocol': 'UDP',
+                    'src_port': udp_layer.sport,
+                    'dest_port': udp_layer.dport,
+                    'udp_length': udp_layer.len
+                })
+                
+                # Extract payload
+                if udp_layer.payload:
+                    payload_bytes = bytes(udp_layer.payload)
+                    packet_info.update({
+                        'payload_size': len(payload_bytes),
+                        'payload_hex': payload_bytes.hex(),
+                        'payload_raw': payload_bytes[:100].hex() if len(payload_bytes) > 100 else payload_bytes.hex()
+                    })
+                else:
+                    packet_info.update({
+                        'payload_size': 0,
+                        'payload_hex': '',
+                        'payload_raw': ''
+                    })
+            
+            # Add packet summary
+            packet_info['packet_summary'] = packet.summary()
+            
+            return packet_info
+            
+        except Exception as e:
+            print(f"Error extracting packet info: {e}")
+            return None
+    
+    def packet_handler(self, packet):
+        """Handle each captured packet"""
+        try:
+            if not self.is_albion_packet(packet):
+                return
+            
+            packet_info = self.extract_packet_info(packet)
+            if not packet_info:
+                return
+            
+            self.packets_captured.append(packet_info)
+            self.packet_count += 1
+            
+            # Display packet info
+            protocol = packet_info.get('protocol', 'Unknown')
+            src = f"{packet_info.get('src_ip', 'Unknown')}:{packet_info.get('src_port', 'Unknown')}"
+            dest = f"{packet_info.get('dest_ip', 'Unknown')}:{packet_info.get('dest_port', 'Unknown')}"
+            payload_size = packet_info.get('payload_size', 0)
+            
+            print(f"[{self.packet_count}] {packet_info['timestamp'][:19]} | "
+                  f"{protocol} | {src} -> {dest} | "
+                  f"Size: {packet_info['packet_size']}B | Payload: {payload_size}B")
+            
+            # Auto-save every 25 packets
+            if len(self.packets_captured) >= 25:
+                self.save_current_session()
+                self.packets_captured.clear()
+                
+        except Exception as e:
+            print(f"Error handling packet: {e}")
+    
+    def save_current_session(self):
+        """Save current session packets to file"""
+        if not self.packets_captured:
+            return
+            
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        
+        if self.save_format == 'json':
+            self.save_as_json(timestamp)
+        elif self.save_format == 'csv':
+            self.save_as_csv(timestamp)
+        elif self.save_format == 'txt':
+            self.save_as_txt(timestamp)
+        else:
+            self.save_as_json(timestamp)
+    
+    def save_as_json(self, timestamp):
+        """Save packets as JSON file"""
+        filename = f"albion_packets_{timestamp}.json"
+        filepath = os.path.join(self.save_directory, filename)
+        
+        session_data = {
+            'session_info': {
+                'start_time': self.session_start,
+                'save_time': datetime.now().isoformat(),
+                'total_packets_in_batch': len(self.packets_captured),
+                'interface_used': self.interface,
+                'capture_filter': 'Albion Online related traffic'
+            },
+            'packets': self.packets_captured
         }
         
-        # Count items by type
-        item_counts = Counter(item.item_id for item in self.parsed_items)
-        summary['most_common_items'] = item_counts.most_common(10)
-        
-        return summary
-    
-    def to_json(self):
-        """Export data as JSON"""
-        return json.dumps({
-            'summary': self.get_summary(),
-            'items': [item.raw_data for item in self.parsed_items],
-            'malformed': self.malformed,
-            'container_info': self.container_info
-        }, indent=2, default=str)
-
-class AlbionInventoryThread(threading.Thread):
-    """Thread for sniffing Albion Online inventory/storage data"""
-    
-    def __init__(self):
-        threading.Thread.__init__(self)
-        
-        # Known problematic strings that can corrupt data
-        self.problems = ["'", "$", "QH", "?8", "H@", "ZP", "\\x00", "\\xff"]
-        
-        # Inventory-related keywords to look for
-        self.inventory_keywords = [
-            "Container", "Inventory", "Item", "Storage", "Chest", 
-            "Bank", "Guild", "Personal", "Mount", "Equipment",
-            "ItemTypeId", "ItemId", "Amount", "Count", "Quality",
-            "Enchantment", "Tier", "Stack"
-        ]
-        
-        # Thread state
-        self.recording = False
-        self.last_parsed = True
-        self.logs = [""]
-        self.parsed_items = []
-        self.malformed = []
-        self.container_events = []
-        
-        # Statistics
-        self.total_packets = 0
-        self.inventory_packets = 0
-        self.start_time = None
-        
-        # Initialize socket
-        self._setup_socket()
-    
-    def _setup_socket(self):
-        """Setup raw socket for packet capture"""
         try:
-            if platform.system() != "Windows":
-                self.sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
-            else:
-                # Windows setup
-                self.sniffer = socket.socket(socket.AF_INET, socket.SOCK_RAW)
-                self.sniffer.bind((local_ip(), 0))
-                self.sniffer.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
-                
-            print(f"Socket initialized successfully on {local_ip()}")
+            with open(filepath, 'w') as f:
+                json.dump(session_data, f, indent=2, default=str)
+            print(f"[SAVED] {len(self.packets_captured)} packets to {filename}")
         except Exception as e:
-            print(f"Socket setup error: {e}")
-            print("Make sure to run as Administrator/root!")
-            raise
+            print(f"Error saving JSON: {e}")
     
-    def run(self):
-        """Main sniffing loop"""
-        self.recording = True
-        self.start_time = time.time()
-        print("Starting Albion inventory packet capture...")
-        print("Perform inventory actions now (open chests, move items, etc.)")
-        
-        while self.recording:
-            try:
-                # Receive packet data
-                data, addr = self.sniffer.recvfrom(2048)
-                self.total_packets += 1
-                
-                # Convert to string and clean
-                data_str = str(data)
-                for problem in self.problems:
-                    data_str = data_str.replace(problem, "")
-                
-                # Look for inventory-related data
-                if self._contains_inventory_keywords(data_str):
-                    self.inventory_packets += 1
-                    self._process_inventory_data(data_str)
-                    
-            except OSError as e:
-                if self.recording:  # Only print if we're still supposed to be recording
-                    print(f"Socket error: {e}")
-                break
-            except Exception as e:
-                print(f"Unexpected error: {e}")
-                continue
-        
-        # Final parsing
-        if not self.last_parsed:
-            self.parse_data()
-        
-        print(f"\nCapture complete!")
-        print(f"Total packets: {self.total_packets}")
-        print(f"Inventory packets: {self.inventory_packets}")
-        print(f"Duration: {time.time() - self.start_time:.1f}s")
-    
-    def _contains_inventory_keywords(self, data_str):
-        """Check if data contains inventory-related keywords"""
-        return any(keyword.lower() in data_str.lower() for keyword in self.inventory_keywords)
-    
-    def _process_inventory_data(self, data_str):
-        """Process data that appears to contain inventory information"""
-        # Look for JSON-like structures
-        chunks = []
-        
-        # Split on common delimiters and look for JSON patterns
-        potential_chunks = [s for s in data_str.split("\\") if len(s) > 5]
-        
-        for chunk in potential_chunks:
-            # Look for JSON patterns
-            if "{" in chunk or "Item" in chunk or "Container" in chunk:
-                # Clean up the chunk
-                if "{" in chunk:
-                    json_start = chunk.find("{")
-                    clean_chunk = chunk[json_start:]
-                    chunks.append(clean_chunk)
-                elif any(keyword in chunk for keyword in self.inventory_keywords):
-                    chunks.append(chunk)
-        
-        # Process chunks
-        for chunk in chunks:
-            if "{" in chunk[:10]:  # New JSON object
-                self.logs.append(chunk)
-            elif self.logs and not chunk.startswith("b'"):  # Continuation
-                self.logs[-1] += chunk
-        
-        self.last_parsed = False
-    
-    def parse_data(self):
-        """Parse collected data into inventory items"""
-        self.parsed_items = []
-        self.malformed = []
-        
-        if not self.logs[0]:
-            self.logs.pop(0)
-        
-        print(f"Parsing {len(self.logs)} log entries...")
-        
-        for i, log in enumerate(self.logs):
-            try:
-                # Try to parse as JSON first
-                if "{" in log and "}" in log:
-                    # Extract JSON part
-                    json_start = log.find("{")
-                    json_end = log.rfind("}") + 1
-                    json_str = log[json_start:json_end]
-                    
-                    # Clean up common issues
-                    json_str = json_str.replace("'", '"')  # Fix single quotes
-                    json_str = json_str.replace('True', 'true').replace('False', 'false')
-                    
-                    try:
-                        data_dict = json.loads(json_str)
-                        # Check if this looks like inventory data
-                        if self._is_inventory_data(data_dict):
-                            item = InventoryItem(data_dict)
-                            self.parsed_items.append(item)
-                        else:
-                            # Store as potential container/metadata
-                            self.container_events.append(data_dict)
-                    except json.JSONDecodeError:
-                        # Try alternative parsing methods
-                        alt_parsed = self._alternative_parse(log)
-                        if alt_parsed:
-                            self.parsed_items.extend(alt_parsed)
-                        else:
-                            self.malformed.append(log)
-                else:
-                    # Non-JSON inventory data
-                    alt_parsed = self._alternative_parse(log)
-                    if alt_parsed:
-                        self.parsed_items.extend(alt_parsed)
-                    else:
-                        self.malformed.append(log)
-                        
-            except Exception as e:
-                print(f"Parse error for log {i}: {e}")
-                self.malformed.append(log)
-        
-        self.last_parsed = True
-        print(f"Parsed {len(self.parsed_items)} items, {len(self.malformed)} malformed entries")
-    
-    def _is_inventory_data(self, data_dict):
-        """Check if parsed data represents inventory items"""
-        inventory_indicators = ['ItemTypeId', 'ItemId', 'Amount', 'Count', 'Quality', 'Tier']
-        return any(key in data_dict for key in inventory_indicators)
-    
-    def _alternative_parse(self, log_entry):
-        """Alternative parsing for non-JSON inventory data"""
-        items = []
-        
-        # Look for patterns like "ItemId:12345 Amount:50 Quality:1"
-        import re
-        
-        # Pattern for key:value pairs
-        kv_pattern = r'(\w+):([^\s]+)'
-        matches = re.findall(kv_pattern, log_entry)
-        
-        if matches:
-            data_dict = {key: value for key, value in matches}
-            # Convert numeric values
-            for key in ['Amount', 'Count', 'Quality', 'Tier', 'ItemId', 'ItemTypeId']:
-                if key in data_dict:
-                    try:
-                        data_dict[key] = int(data_dict[key])
-                    except ValueError:
-                        pass
-            
-            if self._is_inventory_data(data_dict):
-                items.append(InventoryItem(data_dict))
-        
-        return items
-    
-    def get_data(self):
-        """Get current inventory data"""
-        if self.logs == [""]:
-            return InventoryData([], [], [])
-        
-        if not self.last_parsed:
-            self.parse_data()
-        
-        return InventoryData(self.logs, self.parsed_items, self.malformed, 
-                           {'container_events': self.container_events})
-    
-    def stop(self):
-        """Stop the sniffing thread"""
-        self.recording = False
-        try:
-            self.sniffer.close()
-        except:
-            pass
-
-class AlbionInventoryAnalyzer:
-    """Main analyzer class for Albion inventory management"""
-    
-    def __init__(self):
-        self.sniffer_thread = None
-        self.current_data = None
-    
-    def start_capture(self, duration=120):
-        """Start capturing inventory data"""
-        print("=== Albion Online Inventory Analyzer ===")
-        print(f"Capture duration: {duration} seconds")
-        print("\nRecommended actions to perform:")
-        print("1. Open your inventory")
-        print("2. Open storage chests/banks")
-        print("3. Move items between containers")
-        print("4. Check guild storage")
-        print("5. Open mount inventory")
-        print("\nMake sure Albion Online is running!")
-        
-        input("Press Enter to start capture...")
+    def save_as_csv(self, timestamp):
+        """Save packets as CSV file"""
+        filename = f"albion_packets_{timestamp}.csv"
+        filepath = os.path.join(self.save_directory, filename)
         
         try:
-            self.sniffer_thread = AlbionInventoryThread()
-            self.sniffer_thread.start()
+            with open(filepath, 'w', newline='', encoding='utf-8') as f:
+                if not self.packets_captured:
+                    return
+                
+                # Get all possible field names
+                all_fields = set()
+                for packet in self.packets_captured:
+                    all_fields.update(packet.keys())
+                
+                writer = csv.DictWriter(f, fieldnames=sorted(all_fields))
+                writer.writeheader()
+                
+                for packet in self.packets_captured:
+                    writer.writerow(packet)
             
-            # Let it run for specified duration
-            time.sleep(duration)
+            print(f"[SAVED] {len(self.packets_captured)} packets to {filename}")
+        except Exception as e:
+            print(f"Error saving CSV: {e}")
+    
+    def save_as_txt(self, timestamp):
+        """Save packets as readable text file"""
+        filename = f"albion_packets_{timestamp}.txt"
+        filepath = os.path.join(self.save_directory, filename)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(f"Albion Online Packet Capture - Scapy Version\n")
+                f.write(f"Session Start: {self.session_start}\n")
+                f.write(f"Interface: {self.interface or 'Auto-selected'}\n")
+                f.write(f"Batch Time: {datetime.now().isoformat()}\n")
+                f.write(f"Packets in batch: {len(self.packets_captured)}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for i, packet in enumerate(self.packets_captured, 1):
+                    f.write(f"Packet #{i}\n")
+                    f.write(f"Timestamp: {packet.get('timestamp', 'Unknown')}\n")
+                    f.write(f"Protocol: {packet.get('protocol', 'Unknown')}\n")
+                    f.write(f"Source: {packet.get('src_ip', 'Unknown')}:{packet.get('src_port', 'Unknown')}\n")
+                    f.write(f"Destination: {packet.get('dest_ip', 'Unknown')}:{packet.get('dest_port', 'Unknown')}\n")
+                    f.write(f"Packet Size: {packet.get('packet_size', 0)} bytes\n")
+                    f.write(f"Payload Size: {packet.get('payload_size', 0)} bytes\n")
+                    
+                    if packet.get('sequence'):
+                        f.write(f"TCP Sequence: {packet['sequence']}\n")
+                    if packet.get('acknowledgment'):
+                        f.write(f"TCP Acknowledgment: {packet['acknowledgment']}\n")
+                    if packet.get('tcp_flags'):
+                        f.write(f"TCP Flags: {packet['tcp_flags']}\n")
+                    
+                    if packet.get('payload_raw'):
+                        f.write(f"Payload (first 100 bytes): {packet['payload_raw']}\n")
+                    
+                    f.write(f"Summary: {packet.get('packet_summary', 'N/A')}\n")
+                    f.write("-" * 60 + "\n\n")
             
-            # Stop capture
-            self.sniffer_thread.stop()
-            self.sniffer_thread.join(timeout=5)
+            print(f"[SAVED] {len(self.packets_captured)} packets to {filename}")
+        except Exception as e:
+            print(f"Error saving TXT: {e}")
+    
+    def start_capture(self):
+        """Start packet capture using Scapy"""
+        print(f"Starting Albion Online packet capture with Scapy...")
+        print(f"Save format: {self.save_format.upper()}")
+        print(f"Save directory: {self.save_directory}")
+        print(f"Interface: {self.interface or 'Auto-selected'}")
+        print("\nLooking for packets on ports:", list(self.albion_ports))
+        print("Press Ctrl+C to stop capture\n")
+        
+        self.session_start = datetime.now().isoformat()
+        self.running = True
+        
+        try:
+            # Create capture filter for better performance
+            capture_filter = f"tcp portrange 5050-5065 or udp portrange 5050-5065"
             
-            # Get results
-            self.current_data = self.sniffer_thread.get_data()
-            self.generate_report()
+            # Start sniffing
+            sniff(
+                iface=self.interface,
+                prn=self.packet_handler,
+                filter=capture_filter,
+                store=False,  # Don't store packets in memory
+                stop_filter=lambda x: not self.running
+            )
             
         except KeyboardInterrupt:
             print("\nCapture interrupted by user")
-            if self.sniffer_thread:
-                self.sniffer_thread.stop()
         except Exception as e:
-            print(f"Capture error: {e}")
-            if self.sniffer_thread:
-                self.sniffer_thread.stop()
+            print(f"Error during capture: {e}")
+        finally:
+            self.running = False
+            
+            # Save any remaining packets
+            if self.packets_captured:
+                self.save_current_session()
+            
+            print(f"\nCapture session ended.")
+            print(f"Total packets captured: {self.packet_count}")
+            print(f"Files saved in: {self.save_directory}")
+
+def main():
+    if not SCAPY_AVAILABLE:
+        print("Please install Scapy first:")
+        print("pip install scapy")
+        return
     
-    def generate_report(self):
-        """Generate analysis report"""
-        if not self.current_data:
-            print("No data to analyze!")
-            return
-        
-        print(f"\n=== Inventory Analysis Report ===")
-        summary = self.current_data.get_summary()
-        
-        print(f"Capture completed at: {summary['timestamp']}")
-        print(f"Total items found: {summary['total_items']}")
-        print(f"Unique item types: {summary['unique_items']}")
-        print(f"Total quantity: {summary['total_quantity']}")
-        print(f"Malformed packets: {summary['malformed_packets']}")
-        
-        if summary['most_common_items']:
-            print(f"\nMost common items:")
-            for item_id, count in summary['most_common_items']:
-                print(f"  {item_id}: {count} instances")
-        
-        # Show sample items
-        if self.current_data.parsed_items:
-            print(f"\nSample items found:")
-            for item in self.current_data.parsed_items[:10]:
-                print(f"  {item}")
-        
-        # Save data
-        self.save_data()
+    print("Albion Online Packet Sniffer - Scapy Edition")
+    print("=" * 50)
     
-    def save_data(self):
-        """Save captured data to file"""
-        if not self.current_data:
-            return
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"albion_inventory_{timestamp}.json"
-        
-        try:
-            with open(filename, 'w') as f:
-                f.write(self.current_data.to_json())
-            print(f"\nData saved to: {filename}")
-        except Exception as e:
-            print(f"Error saving data: {e}")
+    # Choose save format
+    print("\nChoose save format:")
+    print("1. JSON (structured data with full details)")
+    print("2. CSV (spreadsheet compatible)")
+    print("3. TXT (human readable)")
+    
+    while True:
+        choice = input("Enter choice (1-3) or press Enter for JSON: ").strip()
+        if choice == '1' or choice == '':
+            save_format = 'json'
+            break
+        elif choice == '2':
+            save_format = 'csv'
+            break
+        elif choice == '3':
+            save_format = 'txt'
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    # Optional: custom save directory
+    save_dir = input("Enter save directory (or press Enter for 'captured_packets'): ").strip()
+    if not save_dir:
+        save_dir = 'captured_packets'
+    
+    # Create sniffer and let user select interface
+    sniffer = AlbionPacketSniffer(save_format=save_format, save_directory=save_dir)
+    
+    print("\nInterface selection:")
+    interface = sniffer.select_interface()
+    sniffer.interface = interface
+    
+    print(f"\nStarting capture...")
+    print("Note: You may need to run this as administrator for full packet access")
+    
+    # Start capture
+    sniffer.start_capture()
 
 if __name__ == "__main__":
-    print("Albion Online Inventory Management Tool")
-    print("Based on existing Albion network sniffer")
-    print("Make sure to run as Administrator on Windows!\n")
-    
-    analyzer = AlbionInventoryAnalyzer()
-    
-    try:
-        duration = input("Capture duration in seconds (default 60): ").strip()
-        duration = int(duration) if duration else 60
-        analyzer.start_capture(duration)
-    except ValueError:
-        print("Invalid duration, using 60 seconds")
-        analyzer.start_capture(60)
-    except KeyboardInterrupt:
-        print("\nExiting...")
+    main()
