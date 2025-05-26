@@ -65,7 +65,7 @@ class AlbionPacketSniffer:
                 case 92:
                     print(payload.parameters)
                 case 99: #Attach items to container on open
-                    print(payload.parameters.__getattribute__("0"))
+                    print(payload.parameters)
                 case 100: #Close item container
                     print(payload.parameters)
                 case 101:
