@@ -66,12 +66,14 @@ class AlbionPacketSniffer:
                     packet = pd.packet_100_detachItemContainer()
                     packet.try_deserialize(payload.parameters)
                     packet.pretty_print()
+
                 case 30: # equip
                     packet = pd.packet_30_newEquipmentItem()
                     packet.try_deserialize(payload.parameters)
                     packet.pretty_print()
                 case 32: # simple items (food etc.)
                     print(payload.parameters)
+
                     """ 
                     case 31: # banners
                         print(payload.parameters)
@@ -87,14 +89,16 @@ class AlbionPacketSniffer:
                         print(payload.parameters)
                     case 28: #InventoryState
                         print(payload.parameters) """
+                    
+                    
 
     def on_rq(self, payload: OperationRequest, timestamp: Optional[int] = None, _: Optional[int] = None):
         if 253 in payload.parameters:
             code: int = payload.parameters[253]
             #print(payload.parameters)
             match code:
-                case 407:
-                    print(payload.parameters)
+                case 35:
+                    pass
            
 
     def on_rs(self, payload: OperationResponse, timestamp: Optional[int] = None, _: Optional[int] = None) -> None:
@@ -102,8 +106,11 @@ class AlbionPacketSniffer:
             code: int = payload.parameters[253]
             #print(payload.parameters)
             match code:
-                case 407:
+                case 35:
                     print(payload.parameters)
+                    packet = pd.op_packet_35_ChangeCluster()
+                    packet.try_deserialize(payload.parameters)
+                    packet.pretty_print()
 
     def get_available_interfaces(self):
         """Get list of available network interfaces"""
@@ -463,35 +470,8 @@ def main():
         return
     
     print("Albion Online Packet Sniffer - Scapy Edition")
-    print("=" * 50)
-    
-    # Choose save format
-    print("\nChoose save format:")
-    print("1. JSON (structured data with full details)")
-    print("2. CSV (spreadsheet compatible)")
-    print("3. TXT (human readable)")
-    
-    while True:
-        choice = input("Enter choice (1-3) or press Enter for JSON: ").strip()
-        if choice == '1' or choice == '':
-            save_format = 'json'
-            break
-        elif choice == '2':
-            save_format = 'csv'
-            break
-        elif choice == '3':
-            save_format = 'txt'
-            break
-        else:
-            print("Invalid choice. Please enter 1, 2, or 3.")
-    
-    # Optional: custom save directory
-    save_dir = input("Enter save directory (or press Enter for 'captured_packets'): ").strip()
-    if not save_dir:
-        save_dir = 'captured_packets'
-    
     # Create sniffer and let user select interface
-    sniffer = AlbionPacketSniffer(save_format=save_format, save_directory=save_dir)
+    sniffer = AlbionPacketSniffer()
     
     print("\nInterface selection:")
     interface = sniffer.select_interface()
